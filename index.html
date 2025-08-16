@@ -1,25 +1,385 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-    <title>Neon Flying Box</title>
-    <style>
-        body {
-            margin: 0;
-            background: black; /* Sky blue */
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-        }
-        canvas {
-            background: #70c5ce;
-            display: block;
-        }
-    </style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no" />
+  <title>Neon Flying Box — Difficulty Scaling</title>
+
+  <!-- Optional neon font -->
+  <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+
+  <style>
+    /* ---------- Basic layout & reset ---------- */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #050014; font-family: "Press Start 2P", Arial, sans-serif; -webkit-font-smoothing: antialiased;}
+    body { display:flex; align-items:center; justify-content:center; overflow:hidden; color:#fff; }
+
+    /* ---------- Game container & responsive canvas ---------- */
+    .game-wrapper {
+      width: 100%;
+      max-width: 520px;
+      aspect-ratio: 2/3; /* keeps canvas ratio same as 400x600 */
+      position: relative;
+    }
+
+    canvas {
+      width: 100%;
+      height: 100%;
+      display:block;
+      border-radius: 12px;
+      border: 4px solid #0ff;
+      box-shadow: 0 0 18px #0ff, 0 0 36px #0ff;
+      background: transparent;
+      touch-action: manipulation;
+    }
+
+    /* ---------- Overlays (menu / gameover) ---------- */
+    .overlay {
+      position: absolute;
+      inset: 0;
+      display:flex;
+      flex-direction:column;
+      justify-content:center;
+      align-items:center;
+      gap:12px;
+      z-index: 2;
+      text-align:center;
+      pointer-events: auto; /* allow clicks */
+    }
+    .hidden { display:none; }
+
+    .title {
+      color:rgb(255, 0, 0);
+      text-shadow: 0 0 8px #0ff, 0 0 16px #0ff;
+      font-size: 18px;
+    }
+
+    .hint { font-size:12px; opacity:0.8; color:#aaffff; }
+
+    .btn {
+      -webkit-tap-highlight-color: transparent;
+      padding: 10px 18px;
+      border-radius: 10px;
+      border: 2px solid #0ff;
+      background: rgba(0,0,0,0.35);
+      color: #0ff;
+      cursor: pointer;
+      font-size: 13px;
+      box-shadow: 0 0 10px #0ff, 0 0 18px #0ff inset;
+      transition: transform .08s ease, background .12s ease;
+    }
+    .btn:active { transform: scale(.98); }
+    .btn:hover { background: #0ff; color:#001; box-shadow: 0 0 20px #0ff, 0 0 40px #0ff inset; }
+
+    /* small screens tweak */
+    @media (max-width:360px){
+      .title { font-size:16px; }
+      .btn { padding: 8px 14px; font-size: 12px; }
+    }
+  </style>
 </head>
 <body>
-    <canvas id="gameCanvas" width="400" height="600"></canvas>
+  <div class="game-wrapper">
+    <canvas id="gameCanvas" width="400" height="600" aria-label="Neon Flying Box"></canvas>
 
-    <script src="up.js"></script>
+    <!-- Main menu overlay -->
+    <div id="menuOverlay" class="overlay">
+      <div class="title">What are looking <br> press the button <br> if you want to play <br> or get out </div>
+      <button id="playBtn" class="btn" type="button">Play</button>
+      <div class="hint">Tap / Click to flap while playing</div>
+    </div>
+
+    <!-- Game over overlay -->
+    <div id="gameoverOverlay" class="overlay hidden">
+      <div id="gameOverTitle" class="title">Game Over</div>
+      <div id="scoreText" class="hint">Score: 0 — High: 0</div>
+      <div style="display:flex; gap:10px; margin-top:6px;">
+        <button id="restartBtn" class="btn" type="button">Restart</button>
+        <button id="menuBtn" class="btn" type="button">Main Menu</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /* ===========================
+       Difficulty-scaling single-file game
+       Only feature set: Difficulty scaling (clean, stable)
+       =========================== */
+
+    // Canvas
+    const canvas = document.getElementById("gameCanvas");
+    const ctx = canvas.getContext("2d");
+
+    // Overlays & controls
+    const menuOverlay = document.getElementById("menuOverlay");
+    const gameoverOverlay = document.getElementById("gameoverOverlay");
+    const playBtn = document.getElementById("playBtn");
+    const restartBtn = document.getElementById("restartBtn");
+    const menuBtn = document.getElementById("menuBtn");
+    const scoreText = document.getElementById("scoreText");
+
+    // Game state
+    let state = "menu"; // "menu" | "game" | "gameover"
+
+    // Bird
+    const BIRD_X = 50;
+    let birdY = 150;
+    const birdW = 30, birdH = 30;
+    let vy = 0;
+    const GRAV = 0.5;
+    const JUMP = -8;
+
+    // Pipes & difficulty
+    let pipes = [];           // {x, top, bottom, passed}
+    const PIPE_W = 52;
+    let pipeGap = 150;        // dynamic - will shrink as difficulty increases
+    let pipeSpeed = 2.0;      // dynamic - will increase as score increases
+    const MIN_GAP = 100;      // smallest allowed gap
+    const MAX_SPEED = 6.0;    // cap pipe speed for fair play
+    const GAP_DECREASE = 5;   // amount gap reduces when leveling
+    const SPEED_INCREASE = 0.25; // speed increase per difficulty step
+    const SCORE_PER_STEP = 5; // every N points we increase difficulty
+
+    // Score
+    let score = 0;
+    let highScore = Number(localStorage.getItem("neon_high")) || 0;
+
+    // Timing / spawn
+    let frame = 0;
+    const BASE_SPAWN_RATE = 90; // frames between pipes at start
+    function currentSpawnRate() {
+      // Keep spawn rate roughly proportional to pipeSpeed (faster pipes = more frequent)
+      return Math.max(60, Math.round(BASE_SPAWN_RATE - (pipeSpeed - 2) * 6));
+    }
+
+    // ---------- Helper functions ----------
+    function setState(next) {
+      if (state === next) return;
+      state = next;
+      updateUI();
+    }
+
+    function updateUI() {
+      if (state === "menu") {
+        menuOverlay.classList.remove("hidden");
+        gameoverOverlay.classList.add("hidden");
+      } else if (state === "game") {
+        menuOverlay.classList.add("hidden");
+        gameoverOverlay.classList.add("hidden");
+      } else if (state === "gameover") {
+        menuOverlay.classList.add("hidden");
+        gameoverOverlay.classList.remove("hidden");
+        scoreText.textContent = `Score: ${score} — High: ${highScore}`;
+      }
+    }
+
+    function resetGame() {
+      birdY = 150;
+      vy = 0;
+      pipes = [];
+      score = 0;
+      pipeGap = 150;
+      pipeSpeed = 2.0;
+      frame = 0;
+    }
+
+    // Spawn a pipe pair (top height, bottom computed by gap)
+    function spawnPipe() {
+      const minTop = 40;
+      const maxTop = canvas.height - pipeGap - 80;
+      const top = Math.random() * (maxTop - minTop) + minTop;
+      pipes.push({ x: canvas.width, top: top, bottom: canvas.height - top - pipeGap, passed: false });
+    }
+
+    // Update pipes: move, remove, scoring, difficulty scaling
+    function updatePipes() {
+      for (let p of pipes) {
+        p.x -= pipeSpeed;
+      }
+
+      // Score when a pipe pair passes the bird (and not yet counted)
+      for (let p of pipes) {
+        if (!p.passed && p.x + PIPE_W < BIRD_X) {
+          p.passed = true;
+          score++;
+          // difficulty scaling: every SCORE_PER_STEP points, increase difficulty
+          if (score % SCORE_PER_STEP === 0) {
+            // increase speed
+            pipeSpeed = Math.min(MAX_SPEED, +(pipeSpeed + SPEED_INCREASE).toFixed(3));
+            // decrease gap
+            if (pipeGap > MIN_GAP) pipeGap = Math.max(MIN_GAP, pipeGap - GAP_DECREASE);
+          }
+          // update high score immediately
+          if (score > highScore) {
+            highScore = score;
+            localStorage.setItem("neon_high", String(highScore));
+          }
+        }
+      }
+
+      // Remove off-screen pipes
+      if (pipes.length && pipes[0].x < -PIPE_W - 10) {
+        pipes.shift();
+      }
+    }
+
+    // Collision detection (AABB)
+    function checkCollisions() {
+      // Bird with ground/ceiling
+      if (birdY < 0 || birdY + birdH > canvas.height) {
+        return true;
+      }
+      // Bird with pipes
+      for (let p of pipes) {
+        if (BIRD_X < p.x + PIPE_W &&
+            BIRD_X + birdW > p.x &&
+            (birdY < p.top || birdY + birdH > canvas.height - p.bottom)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // ---------- Drawing ----------
+    function drawBackground() {
+      // simple vertical gradient neon-ish
+      const g = ctx.createLinearGradient(0, 0, 0, canvas.height);
+      g.addColorStop(0, "#07071a");
+      g.addColorStop(1, "#0a0028");
+      ctx.fillStyle = g;
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    function drawPipes() {
+      ctx.fillStyle = "#0ff";
+      ctx.shadowColor = "#0ff";
+      ctx.shadowBlur = 20;
+      for (let p of pipes) {
+        ctx.fillRect(p.x, 0, PIPE_W, p.top);
+        ctx.fillRect(p.x, canvas.height - p.bottom, PIPE_W, p.bottom);
+      }
+      ctx.shadowBlur = 0;
+    }
+
+    function drawBird() {
+      ctx.fillStyle = "#ff0";
+      ctx.shadowColor = "#ff0";
+      ctx.shadowBlur = 20;
+      ctx.fillRect(BIRD_X, birdY, birdW, birdH);
+      ctx.shadowBlur = 0;
+    }
+
+    function drawHUD() {
+      ctx.fillStyle = "#fff";
+      ctx.shadowColor = "#f0f";
+      ctx.shadowBlur = 10;
+      ctx.font = "16px 'Press Start 2P', Arial";
+      ctx.fillText(`Score: ${score}`, 10, 28);
+      ctx.fillText(`High: ${highScore}`, 10, 52);
+      ctx.shadowBlur = 0;
+
+      // small difficulty info (optional)
+      ctx.font = "10px Arial";
+      ctx.fillStyle = "#aaffff";
+      ctx.fillText(`Speed: ${pipeSpeed.toFixed(2)}  Gap: ${pipeGap}`, 10, canvas.height - 10);
+    }
+
+    // ---------- Main loop ----------
+    function loop() {
+      // clear + background
+      drawBackground();
+
+      if (state === "menu") {
+        // show title on canvas too (but UI overlay also shows)
+        ctx.fillStyle = "#0ff";
+        ctx.shadowColor = "#0ff";
+        ctx.shadowBlur = 18;
+        ctx.font = "26px 'Press Start 2P', Arial";
+        const text = "NEON FLYING BOX";
+        const tw = ctx.measureText(text).width;
+        ctx.fillText(text, (canvas.width - tw) / 2, canvas.height * 0.35);
+        ctx.shadowBlur = 0;
+      } else if (state === "game") {
+        // physics
+        vy += GRAV;
+        birdY += vy;
+
+        // spawn pipes periodically; spawn rate adapts slightly with speed
+        frame++;
+        const spawnRate = currentSpawnRate();
+        if (frame % spawnRate === 0) spawnPipe();
+
+        updatePipes();
+
+        // collision check
+        if (checkCollisions()) {
+          setState("gameover");
+        }
+
+        // draw game world
+        drawPipes();
+        drawBird();
+        drawHUD();
+      } else if (state === "gameover") {
+        drawPipes();
+        drawBird();
+        drawHUD();
+        // show game-over text on canvas (overlay will also be visible)
+        ctx.fillStyle = "#fff";
+        ctx.shadowColor = "#f0f";
+        ctx.shadowBlur = 18;
+        ctx.font = "22px 'Press Start 2P', Arial";
+        const msg = "GAME OVER";
+        const tw2 = ctx.measureText(msg).width;
+        ctx.fillText(msg, (canvas.width - tw2) / 2, canvas.height * 0.38);
+        ctx.shadowBlur = 0;
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    // ---------- Input handlers ----------
+    function handleJumpStart() {
+      if (state === "menu") {
+        resetGame();
+        setState("game");
+        return;
+      }
+      if (state === "game") {
+        vy = JUMP;
+      }
+    }
+
+    // pointer + touch + keyboard
+    canvas.addEventListener("pointerdown", handleJumpStart);
+    canvas.addEventListener("touchstart", (e) => { e.preventDefault(); handleJumpStart(); }, { passive: false });
+    document.addEventListener("keydown", (e) => {
+      if (e.code === "Space") {
+        e.preventDefault();
+        handleJumpStart();
+      }
+      // quick restart/menu shortcuts
+      if (state === "gameover") {
+        if (e.code === "KeyR") { resetGame(); setState("game"); }
+        if (e.code === "KeyM") { setState("menu"); }
+      }
+    });
+
+    // overlay buttons
+    playBtn.addEventListener("click", () => { resetGame(); setState("game"); });
+    restartBtn.addEventListener("click", () => { resetGame(); setState("game"); });
+    menuBtn.addEventListener("click", () => { setState("menu"); });
+
+    // ---------- Start ----------
+    updateUI();
+    loop();
+
+    // ---------- Notes ----------
+    // This build focuses only on a clean, stable difficulty-scaling system:
+    // - Score increases when a pipe pair fully passes the bird (p.passed flag).
+    // - Every SCORE_PER_STEP points, pipeSpeed increases and pipeGap decreases (within caps).
+    // - Spawn rate adapts to speed so flow stays reasonable.
+    // If you want next: background animation, collectibles, powerups — we'll add them one-by-one.
+  </script>
 </body>
 </html>
